@@ -27,7 +27,7 @@ pub mod pallet {
 	};
 	use frame_system::pallet_prelude::{OriginFor, *};
 
-	use crate::types::{Gender, Kitty};
+	use crate::types::{BalanceOf, Gender, Kitty};
 
 	#[pallet::pallet]
 	#[pallet::generate_store(pub(super) trait Store)]
@@ -78,6 +78,12 @@ pub mod pallet {
 		DuplicateKitty,
 		/// An overflow has occured.
 		Overflow,
+		/// The kitty does not exist.
+		NoKitty,
+		/// The kitty is not owned by the sender.
+		NotOwner,
+		/// Trying to transfer to the same owner.
+		TransferToSelf,
 	}
 
 	// Custom events for the pallet.
@@ -87,6 +93,10 @@ pub mod pallet {
 	pub enum Event<T: Config> {
 		/// A new kitty has been created.
 		Created { kitty: [u8; 16], owner: T::AccountId },
+		/// A new kitty has been transferred.
+		Transferred { kitty: [u8; 16], from: T::AccountId, to: T::AccountId },
+		/// When the price of a kitty is set.
+		PriceSet { kitty: [u8; 16], price: Option<BalanceOf<T>> },
 	}
 
 	// Dispatchable functions allows users to interact with the pallet and invoke state changes.
@@ -104,6 +114,37 @@ pub mod pallet {
 
 			// Write the new kitty to storage.
 			Self::mint(&sender, kitty_gen_dna, gender)?;
+			Ok(())
+		}
+
+		/// Transfer a new kitty.
+		#[pallet::weight(0)]
+		pub fn transfer_kitty(
+			origin: OriginFor<T>,
+			kitty_dna: [u8; 16],
+			to: T::AccountId,
+		) -> DispatchResult {
+			// Make sure the caller is from a signed origin and retrieve the signer.
+			let sender = ensure_signed(origin)?;
+
+			// Perform the transfer.
+			Self::transfer(&sender, &to, kitty_dna)?;
+
+			Ok(())
+		}
+
+		/// Set the price of a kitty.
+		#[pallet::weight(0)]
+		pub fn set_price_kitty(
+			origin: OriginFor<T>,
+			kitty_dna: [u8; 16],
+			price: Option<BalanceOf<T>>,
+		) -> DispatchResult {
+			// Make sure the caller is from a signed origin and retrieve the signer.
+			let sender = ensure_signed(origin)?;
+
+			Self::set_price(&sender, kitty_dna, price)?;
+
 			Ok(())
 		}
 	}
@@ -161,6 +202,77 @@ pub mod pallet {
 
 			// Return the DNA of the created kitty if it succeeds.
 			Ok(dna)
+		}
+
+		/// Transfer a kitty.
+		pub fn transfer(
+			from: &T::AccountId,
+			to: &T::AccountId,
+			kitty_id: [u8; 16],
+		) -> Result<(), DispatchError> {
+			// Check if the kitty exists.
+			let kitty = Kitties::<T>::get(&kitty_id).ok_or(Error::<T>::NoKitty)?;
+			// Check if the sender is the owner of the kitty.
+			ensure!(kitty.owner == *from, Error::<T>::NotOwner);
+
+			// Ensure the sender is not transferring to themselves.
+			ensure!(kitty.owner != *to, Error::<T>::TransferToSelf);
+
+			// Remove the kitty from the bounded vec for the sender.
+			KittiesOwned::<T>::try_mutate_exists(from, |kitties| -> Result<(), DispatchError> {
+				// Get the kitties owned by the sender.
+				let kitties = kitties.as_mut().ok_or(Error::<T>::NoKitty)?;
+				// Get the position of the kitty in the bounded vec.
+				let pos =
+					kitties.iter().position(|k| *k == kitty_id).ok_or(Error::<T>::NotOwner)?;
+				// Remove the kitty from the bounded vec.
+				kitties.remove(pos);
+				Ok(())
+			})?;
+
+			// Insert the kitty into the bounded vec for the receiver.
+			KittiesOwned::<T>::try_append(&to, kitty_id).map_err(|_| Error::<T>::TooManyOwned)?;
+
+			// Update the owner of the kitty.
+			Kitties::<T>::mutate(&kitty_id, |kitty| {
+				if let Some(kitty) = kitty {
+					kitty.owner = to.clone();
+					// Set price to None.
+					kitty.price = None;
+				}
+			});
+
+			// Emit the event.
+			Self::deposit_event(Event::Transferred {
+				kitty: kitty_id,
+				from: from.clone(),
+				to: to.clone(),
+			});
+
+			Ok(())
+		}
+
+		/// Set the price of a kitty.
+		pub fn set_price(
+			from: &T::AccountId,
+			kitty_id: [u8; 16],
+			price: Option<BalanceOf<T>>,
+		) -> Result<(), DispatchError> {
+			// Check if the kitty exists.
+			let kitty = Kitties::<T>::get(&kitty_id).ok_or(Error::<T>::NoKitty)?;
+			// Check if the sender is the owner of the kitty.
+			ensure!(kitty.owner == *from, Error::<T>::NotOwner);
+
+			// Update the price of the kitty.
+			Kitties::<T>::mutate(&kitty_id, |kitty| {
+				if let Some(kitty) = kitty {
+					kitty.price = price;
+				}
+			});
+
+			// Emit the event.
+			Self::deposit_event(Event::PriceSet { kitty: kitty_id, price });
+			Ok(())
 		}
 	}
 }
