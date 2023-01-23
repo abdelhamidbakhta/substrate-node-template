@@ -23,7 +23,7 @@ mod benchmarking;
 pub mod pallet {
 	use frame_support::{
 		pallet_prelude::{DispatchResult, *},
-		traits::{Currency, Randomness},
+		traits::{Currency, ExistenceRequirement, Randomness},
 	};
 	use frame_system::pallet_prelude::{OriginFor, *};
 
@@ -84,6 +84,11 @@ pub mod pallet {
 		NotOwner,
 		/// Trying to transfer to the same owner.
 		TransferToSelf,
+		/// Ensures that the buying price is greater than the asking price.
+		BidPriceTooLow,
+		/// This kitty is not for sale.
+		NotForSale,
+		NotEnoughBalance,
 	}
 
 	// Custom events for the pallet.
@@ -97,6 +102,8 @@ pub mod pallet {
 		Transferred { kitty: [u8; 16], from: T::AccountId, to: T::AccountId },
 		/// When the price of a kitty is set.
 		PriceSet { kitty: [u8; 16], price: Option<BalanceOf<T>> },
+		/// A new kitty has been sold.
+		Sold { seller: T::AccountId, buyer: T::AccountId, kitty: [u8; 16], price: BalanceOf<T> },
 	}
 
 	// Dispatchable functions allows users to interact with the pallet and invoke state changes.
@@ -147,6 +154,22 @@ pub mod pallet {
 
 			Ok(())
 		}
+
+		/// Buy a kitty.
+		#[pallet::weight(0)]
+		pub fn buy_kitty(
+			origin: OriginFor<T>,
+			to: T::AccountId,
+			kitty_dna: [u8; 16],
+			price: BalanceOf<T>,
+		) -> DispatchResult {
+			// Make sure the caller is from a signed origin and retrieve the signer.
+			let sender = ensure_signed(origin)?;
+
+			Self::buy(kitty_dna, &sender, &to, price)?;
+
+			Ok(())
+		}
 	}
 
 	/// The pallet internal functions.
@@ -174,7 +197,7 @@ pub mod pallet {
 		}
 
 		/// Mint a kitty.
-		pub fn mint(
+		fn mint(
 			owner: &T::AccountId,
 			dna: [u8; 16],
 			gender: Gender,
@@ -205,7 +228,7 @@ pub mod pallet {
 		}
 
 		/// Transfer a kitty.
-		pub fn transfer(
+		fn transfer(
 			from: &T::AccountId,
 			to: &T::AccountId,
 			kitty_id: [u8; 16],
@@ -253,7 +276,7 @@ pub mod pallet {
 		}
 
 		/// Set the price of a kitty.
-		pub fn set_price(
+		fn set_price(
 			from: &T::AccountId,
 			kitty_id: [u8; 16],
 			price: Option<BalanceOf<T>>,
@@ -272,6 +295,39 @@ pub mod pallet {
 
 			// Emit the event.
 			Self::deposit_event(Event::PriceSet { kitty: kitty_id, price });
+			Ok(())
+		}
+
+		/// Buy a kitty.
+		fn buy(
+			kitty_dna: [u8; 16],
+			seller: &T::AccountId,
+			buyer: &T::AccountId,
+			buy_price: BalanceOf<T>,
+		) -> Result<(), DispatchError> {
+			// Check if the buyer has enough balance.
+			ensure!(T::Currency::free_balance(buyer) >= buy_price, Error::<T>::NotEnoughBalance);
+
+			// Read the kitty in the storage.
+			let kitty = Kitties::<T>::get(&kitty_dna).ok_or(Error::<T>::NoKitty)?;
+			// Check that the kitty is for sale.
+			ensure!(kitty.price.is_some(), Error::<T>::NotForSale);
+			// Check that buy price is equal to or greater than the kitty's price.
+			ensure!(kitty.price.unwrap() <= buy_price, Error::<T>::BidPriceTooLow);
+
+			// Transfer the kitty to the buyer.
+			Self::transfer(seller, buyer, kitty_dna)?;
+
+			// Transfer the money to the seller.
+			T::Currency::transfer(buyer, seller, buy_price, ExistenceRequirement::KeepAlive)?;
+
+			// Emit the event.
+			Self::deposit_event(Event::Sold {
+				seller: seller.clone(),
+				buyer: buyer.clone(),
+				kitty: kitty_dna,
+				price: buy_price,
+			});
 			Ok(())
 		}
 	}
