@@ -1,6 +1,11 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+// Custom types for the pallet.
+pub mod types;
+// Storage items for the pallet.
+pub mod storage;
+// Custom errors for the pallet.
+pub mod errors;
 
-/// Edit this file to define custom logic or remove it if it is not needed.
 /// Learn more about FRAME and the core library of Substrate FRAME pallets:
 /// <https://docs.substrate.io/reference/frame-pallets/>
 pub use pallet::*;
@@ -16,8 +21,13 @@ mod benchmarking;
 
 #[frame_support::pallet]
 pub mod pallet {
-	use frame_support::pallet_prelude::*;
-	use frame_system::pallet_prelude::*;
+	use frame_support::{
+		pallet_prelude::{DispatchResult, *},
+		traits::{Currency, Randomness},
+	};
+	use frame_system::pallet_prelude::{OriginFor, *};
+
+	use crate::types::{Gender, Kitty};
 
 	#[pallet::pallet]
 	#[pallet::generate_store(pub(super) trait Store)]
@@ -28,33 +38,55 @@ pub mod pallet {
 	pub trait Config: frame_system::Config {
 		/// Because this pallet emits events, it depends on the runtime's definition of an event.
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
+
+		/// The Currency handler for the kitties pallet.
+		type Currency: Currency<Self::AccountId>;
+
+		/// The maximum number of kitties than a single account can own.
+		#[pallet::constant]
+		type MaxKittiesOwned: Get<u32>;
+
+		/// The type of Randomness wee want to specify for this pallet.
+		type KittyRandomness: Randomness<Self::Hash, Self::BlockNumber>;
 	}
 
-	// The pallet's runtime storage items.
-	// https://docs.substrate.io/main-docs/build/runtime-storage/
+	/// Keeps track of the number of kitties in existence.
 	#[pallet::storage]
-	#[pallet::getter(fn something)]
-	// Learn more about declaring storage items:
-	// https://docs.substrate.io/main-docs/build/runtime-storage/#declaring-storage-items
-	pub type Something<T> = StorageValue<_, u32>;
+	pub(super) type CountForKitties<T: Config> = StorageValue<_, u64, ValueQuery>;
 
-	// Pallets use events to inform users when important changes are made.
+	/// Maps the kitty struct to the kitty DNA.
+	#[pallet::storage]
+	pub(super) type Kitties<T: Config> =
+		StorageMap<_, Twox64Concat, [u8; 16], crate::types::Kitty<T>>;
+
+	/// Tracks the kitties owned by each account.
+	#[pallet::storage]
+	pub(super) type KittiesOwned<T: Config> = StorageMap<
+		_,
+		Twox64Concat,
+		T::AccountId,
+		BoundedVec<[u8; 16], T::MaxKittiesOwned>,
+		ValueQuery,
+	>;
+
+	/// Custom errors for the pallet.
+	#[pallet::error]
+	pub enum Error<T> {
+		/// An account may only own a limited number of kitties.
+		TooManyOwned,
+		/// This kitty already exists.
+		DuplicateKitty,
+		/// An overflow has occured.
+		Overflow,
+	}
+
+	// Custom events for the pallet.
 	// https://docs.substrate.io/main-docs/build/events-errors/
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// Event documentation should end with an array that provides descriptive names for event
-		/// parameters. [something, who]
-		SomethingStored { something: u32, who: T::AccountId },
-	}
-
-	// Errors inform users that something went wrong.
-	#[pallet::error]
-	pub enum Error<T> {
-		/// Error names should be descriptive.
-		NoneValue,
-		/// Errors should have helpful documentation associated with them.
-		StorageOverflow,
+		/// A new kitty has been created.
+		Created { kitty: [u8; 16], owner: T::AccountId },
 	}
 
 	// Dispatchable functions allows users to interact with the pallet and invoke state changes.
@@ -62,43 +94,73 @@ pub mod pallet {
 	// Dispatchable functions must be annotated with a weight and must return a DispatchResult.
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// An example dispatchable that takes a singles value as a parameter, writes the value to
-		/// storage and emits an event. This function must be dispatched by a signed extrinsic.
-		#[pallet::call_index(0)]
-		#[pallet::weight(10_000 + T::DbWeight::get().writes(1).ref_time())]
-		pub fn do_something(origin: OriginFor<T>, something: u32) -> DispatchResult {
-			// Check that the extrinsic was signed and get the signer.
-			// This function will return an error if the extrinsic is not signed.
-			// https://docs.substrate.io/main-docs/build/origins/
-			let who = ensure_signed(origin)?;
+		/// Create a new kitty.
+		#[pallet::weight(0)]
+		pub fn create_kitty(origin: OriginFor<T>) -> DispatchResult {
+			// Make sure the caller is from a signed origin and retrieve the signer.
+			let sender = ensure_signed(origin)?;
+			// Generate unique DNA and Gender.
+			let (kitty_gen_dna, gender) = Self::gen_dna();
 
-			// Update storage.
-			<Something<T>>::put(something);
-
-			// Emit an event.
-			Self::deposit_event(Event::SomethingStored { something, who });
-			// Return a successful DispatchResultWithPostInfo
+			// Write the new kitty to storage.
+			Self::mint(&sender, kitty_gen_dna, gender)?;
 			Ok(())
 		}
+	}
 
-		/// An example dispatchable that may throw a custom error.
-		#[pallet::call_index(1)]
-		#[pallet::weight(10_000 + T::DbWeight::get().reads_writes(1,1).ref_time())]
-		pub fn cause_error(origin: OriginFor<T>) -> DispatchResult {
-			let _who = ensure_signed(origin)?;
+	/// The pallet internal functions.
+	impl<T: Config> Pallet<T> {
+		/// Generates and returns DNA and Gender.
+		fn gen_dna() -> ([u8; 16], Gender) {
+			// Create randomness
+			let random = T::KittyRandomness::random(&b"dna"[..]).0;
 
-			// Read a value from storage.
-			match <Something<T>>::get() {
-				// Return an error if the value has not been set.
-				None => return Err(Error::<T>::NoneValue.into()),
-				Some(old) => {
-					// Increment the value read from storage; will error in the event of overflow.
-					let new = old.checked_add(1).ok_or(Error::<T>::StorageOverflow)?;
-					// Update the value in storage with the incremented result.
-					<Something<T>>::put(new);
-					Ok(())
-				},
+			// Create randomness payload. Multiple kitties can be generated in the same blockm
+			// retaining uniqueness.
+			let unique_payload = (
+				random,
+				frame_system::Pallet::<T>::extrinsic_index().unwrap_or_default(),
+				frame_system::Pallet::<T>::block_number(),
+			);
+
+			// Turns into a byte array.
+			let encoded_payload = unique_payload.encode();
+			let hash = frame_support::Hashable::blake2_128(&encoded_payload);
+			match hash[0] % 2 == 0 {
+				true => (hash, Gender::Male),
+				false => (hash, Gender::Female),
 			}
+		}
+
+		/// Mint a kitty.
+		pub fn mint(
+			owner: &T::AccountId,
+			dna: [u8; 16],
+			gender: Gender,
+		) -> Result<[u8; 16], DispatchError> {
+			let kitty = Kitty::<T> { dna, price: None, gender, owner: owner.clone() };
+
+			// Check if the kitty already exists.
+			let already_exists = Kitties::<T>::contains_key(&kitty.dna);
+			// Dispatch error if the kitty already exists.
+			ensure!(!already_exists, Error::<T>::DuplicateKitty);
+
+			let count = CountForKitties::<T>::get();
+			let new_count = count.checked_add(1).ok_or(Error::<T>::Overflow)?;
+
+			// Insert the kitty into the bounded vec for the owner.
+			KittiesOwned::<T>::try_append(&owner, kitty.dna)
+				.map_err(|_| Error::<T>::TooManyOwned)?;
+
+			// Insert the kitty into the kitties storage map.
+			Kitties::<T>::insert(&kitty.dna, &kitty);
+			CountForKitties::<T>::put(new_count);
+
+			// Emit the event.
+			Self::deposit_event(Event::Created { kitty: kitty.dna, owner: owner.clone() });
+
+			// Return the DNA of the created kitty if it succeeds.
+			Ok(dna)
 		}
 	}
 }
